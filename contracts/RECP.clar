@@ -115,3 +115,68 @@
         (ok true)
     )
 )
+
+
+
+(define-map ProjectUpdates { project-id: uint, update-id: uint } {
+    message: (string-ascii 280),
+    timestamp: uint
+})
+
+(define-map ProjectUpdateCount uint uint)
+
+(define-read-only (get-project-update (project-id uint) (update-id uint))
+    (map-get? ProjectUpdates { project-id: project-id, update-id: update-id })
+)
+
+(define-public (add-project-update (project-id uint) (message (string-ascii 280)))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u14)))
+        (update-count (default-to u0 (map-get? ProjectUpdateCount project-id)))
+    )
+        (asserts! (is-eq tx-sender (get owner project)) (err u15))
+        
+        (map-set ProjectUpdates 
+            { project-id: project-id, update-id: update-count }
+            { message: message, timestamp: stacks-block-height }
+        )
+        (map-set ProjectUpdateCount project-id (+ update-count u1))
+        (ok true)
+    )
+)
+
+
+(define-constant categories (list 
+    "technology"
+    "art"
+    "social"
+    "environment"
+    "business"
+))
+
+(define-map ProjectCategories uint (string-ascii 20))
+
+(define-map CategoryProjects { category: (string-ascii 20) } (list 50 uint))
+
+(define-public (set-project-category (project-id uint) (category (string-ascii 11)))
+    (let ((project (unwrap! (map-get? Projects project-id) (err u16))))
+        (asserts! (is-eq tx-sender (get owner project)) (err u17))
+        (asserts! (is-some (index-of categories category)) (err u18))
+        
+        (map-set ProjectCategories project-id category)
+        (map-set CategoryProjects 
+            { category: category }
+            (unwrap-panic (as-max-len? 
+                (append (default-to (list) (map-get? CategoryProjects { category: category })) project-id)
+                u50
+            ))
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-projects-by-category (category (string-ascii 20)))
+    (default-to (list) (map-get? CategoryProjects { category: category }))
+)
+
+
