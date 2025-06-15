@@ -180,3 +180,173 @@
 )
 
 
+(define-map ProjectMilestones { project-id: uint, milestone-id: uint } {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    funding-amount: uint,
+    status: (string-ascii 20),
+    votes-for: uint,
+    votes-against: uint,
+    voting-deadline: uint,
+    created-at: uint
+})
+
+(define-map ProjectMilestoneCount uint uint)
+
+(define-map MilestoneVotes { project-id: uint, milestone-id: uint, voter: principal } {
+    vote: bool,
+    voting-power: uint
+})
+
+(define-map ProjectMilestoneSettings uint {
+    total-milestones: uint,
+    approval-threshold: uint,
+    voting-period: uint
+})
+
+(define-constant milestone-voting-period u1008)
+(define-constant default-approval-threshold u51)
+
+(define-read-only (get-milestone (project-id uint) (milestone-id uint))
+    (map-get? ProjectMilestones { project-id: project-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-count (project-id uint))
+    (default-to u0 (map-get? ProjectMilestoneCount project-id))
+)
+
+(define-read-only (get-milestone-vote (project-id uint) (milestone-id uint) (voter principal))
+    (map-get? MilestoneVotes { project-id: project-id, milestone-id: milestone-id, voter: voter })
+)
+
+(define-public (setup-milestone-funding (project-id uint) (approval-threshold uint))
+    (let ((project (unwrap! (map-get? Projects project-id) (err u19))))
+        (asserts! (is-eq tx-sender (get owner project)) (err u20))
+        (asserts! (is-eq (get status project) "active") (err u21))
+        (asserts! (and (>= approval-threshold u1) (<= approval-threshold u100)) (err u22))
+        
+        (map-set ProjectMilestoneSettings project-id {
+            total-milestones: u0,
+            approval-threshold: approval-threshold,
+            voting-period: milestone-voting-period
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-milestone (project-id uint) (title (string-ascii 100)) (description (string-ascii 500)) (funding-amount uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u23)))
+        (milestone-count (default-to u0 (map-get? ProjectMilestoneCount project-id)))
+        (settings (unwrap! (map-get? ProjectMilestoneSettings project-id) (err u24)))
+    )
+        (asserts! (is-eq tx-sender (get owner project)) (err u25))
+        (asserts! (is-eq (get status project) "active") (err u26))
+        (asserts! (> funding-amount u0) (err u27))
+        (asserts! (<= funding-amount (get current-amount project)) (err u28))
+        
+        (map-set ProjectMilestones 
+            { project-id: project-id, milestone-id: milestone-count }
+            {
+                title: title,
+                description: description,
+                funding-amount: funding-amount,
+                status: "pending",
+                votes-for: u0,
+                votes-against: u0,
+                voting-deadline: (+ stacks-block-height (get voting-period settings)),
+                created-at: stacks-block-height
+            }
+        )
+        
+        (map-set ProjectMilestoneCount project-id (+ milestone-count u1))
+        (map-set ProjectMilestoneSettings project-id 
+            (merge settings { total-milestones: (+ milestone-count u1) })
+        )
+        (ok milestone-count)
+    )
+)
+
+(define-public (vote-on-milestone (project-id uint) (milestone-id uint) (vote bool))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u29)))
+        (milestone (unwrap! (map-get? ProjectMilestones { project-id: project-id, milestone-id: milestone-id }) (err u30)))
+        (investment (unwrap! (map-get? Investments { project-id: project-id, investor: tx-sender }) (err u31)))
+        (existing-vote (map-get? MilestoneVotes { project-id: project-id, milestone-id: milestone-id, voter: tx-sender }))
+        (voting-power (get amount investment))
+    )
+        (asserts! (is-eq (get status milestone) "pending") (err u32))
+        (asserts! (< stacks-block-height (get voting-deadline milestone)) (err u33))
+        (asserts! (is-none existing-vote) (err u34))
+        
+        (map-set MilestoneVotes 
+            { project-id: project-id, milestone-id: milestone-id, voter: tx-sender }
+            { vote: vote, voting-power: voting-power }
+        )
+        
+        (map-set ProjectMilestones 
+            { project-id: project-id, milestone-id: milestone-id }
+            (merge milestone {
+                votes-for: (if vote (+ (get votes-for milestone) voting-power) (get votes-for milestone)),
+                votes-against: (if vote (get votes-against milestone) (+ (get votes-against milestone) voting-power))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (finalize-milestone (project-id uint) (milestone-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u35)))
+        (milestone (unwrap! (map-get? ProjectMilestones { project-id: project-id, milestone-id: milestone-id }) (err u36)))
+        (settings (unwrap! (map-get? ProjectMilestoneSettings project-id) (err u37)))
+        (total-votes (+ (get votes-for milestone) (get votes-against milestone)))
+        (approval-rate (if (> total-votes u0) (/ (* (get votes-for milestone) u100) total-votes) u0))
+    )
+        (asserts! (>= stacks-block-height (get voting-deadline milestone)) (err u38))
+        (asserts! (is-eq (get status milestone) "pending") (err u39))
+        
+        (if (>= approval-rate (get approval-threshold settings))
+            (begin
+                (try! (as-contract (stx-transfer? (get funding-amount milestone) tx-sender (get owner project))))
+                (map-set ProjectMilestones 
+                    { project-id: project-id, milestone-id: milestone-id }
+                    (merge milestone { status: "approved" })
+                )
+                (ok true)
+            )
+            (begin
+                (map-set ProjectMilestones 
+                    { project-id: project-id, milestone-id: milestone-id }
+                    (merge milestone { status: "rejected" })
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-read-only (get-milestone-approval-rate (project-id uint) (milestone-id uint))
+    (let (
+        (milestone (unwrap! (map-get? ProjectMilestones { project-id: project-id, milestone-id: milestone-id }) (err u40)))
+        (total-votes (+ (get votes-for milestone) (get votes-against milestone)))
+    )
+        (if (> total-votes u0)
+            (ok (/ (* (get votes-for milestone) u100) total-votes))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (get-project-milestone-summary (project-id uint))
+    (let ((settings (map-get? ProjectMilestoneSettings project-id)))
+        (if (is-some settings)
+            (ok {
+                total-milestones: (get total-milestones (unwrap-panic settings)),
+                approval-threshold: (get approval-threshold (unwrap-panic settings)),
+                voting-period: (get voting-period (unwrap-panic settings))
+            })
+            (err u41)
+        )
+    )
+)
