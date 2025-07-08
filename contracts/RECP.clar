@@ -6,6 +6,114 @@
 
 (define-data-var total-projects uint u0)
 
+
+(define-map ProjectOwnerReputation principal {
+    total-projects: uint,
+    successful-projects: uint,
+    failed-projects: uint,
+    total-funds-raised: uint,
+    average-completion-time: uint,
+    reputation-score: uint,
+    last-updated: uint
+})
+
+(define-map InvestorPerformance principal {
+    total-investments: uint,
+    successful-investments: uint,
+    failed-investments: uint,
+    total-invested-amount: uint,
+    total-returns: uint,
+    average-roi: uint,
+    investment-streak: uint,
+    last-investment-block: uint
+})
+
+(define-map ProjectAnalytics uint {
+    funding-velocity: uint,
+    milestone-completion-rate: uint,
+    investor-satisfaction: uint,
+    project-risk-score: uint,
+    funding-timeline: uint,
+    community-engagement: uint
+})
+
+(define-map ProjectReturns uint {
+    total-returned: uint,
+    return-rate: uint,
+    distribution-count: uint,
+    last-distribution: uint
+})
+
+(define-map InvestorReturns { project-id: uint, investor: principal } {
+    total-returned: uint,
+    return-percentage: uint,
+    distribution-history: (list 10 uint)
+})
+
+(define-map GlobalAnalytics (string-ascii 20) uint)
+
+(define-constant reputation-multiplier u100)
+(define-constant min-reputation-score u0)
+(define-constant max-reputation-score u1000)
+(define-constant roi-calculation-base u10000)
+
+(define-read-only (get-owner-reputation (owner principal))
+    (default-to 
+        {
+            total-projects: u0,
+            successful-projects: u0,
+            failed-projects: u0,
+            total-funds-raised: u0,
+            average-completion-time: u0,
+            reputation-score: u500,
+            last-updated: u0
+        }
+        (map-get? ProjectOwnerReputation owner)
+    )
+)
+
+(define-read-only (get-investor-performance (investor principal))
+    (default-to 
+        {
+            total-investments: u0,
+            successful-investments: u0,
+            failed-investments: u0,
+            total-invested-amount: u0,
+            total-returns: u0,
+            average-roi: u0,
+            investment-streak: u0,
+            last-investment-block: u0
+        }
+        (map-get? InvestorPerformance investor)
+    )
+)
+
+(define-read-only (get-project-analytics (project-id uint))
+    (default-to 
+        {
+            funding-velocity: u0,
+            milestone-completion-rate: u0,
+            investor-satisfaction: u0,
+            project-risk-score: u50,
+            funding-timeline: u0,
+            community-engagement: u0
+        }
+        (map-get? ProjectAnalytics project-id)
+    )
+)
+
+(define-read-only (get-project-returns (project-id uint))
+    (default-to 
+        {
+            total-returned: u0,
+            return-rate: u0,
+            distribution-count: u0,
+            last-distribution: u0
+        }
+        (map-get? ProjectReturns project-id)
+    )
+)
+
 (define-map Projects uint {
     owner: principal,
     title: (string-ascii 50),
@@ -347,6 +455,236 @@
                 voting-period: (get voting-period (unwrap-panic settings))
             })
             (err u41)
+        )
+    )
+)
+
+
+(define-read-only (get-investor-returns (project-id uint) (investor principal))
+    (default-to 
+        {
+            total-returned: u0,
+            return-percentage: u0,
+            distribution-history: (list)
+        }
+        (map-get? InvestorReturns { project-id: project-id, investor: investor })
+    )
+)
+
+(define-read-only (get-global-analytics (metric (string-ascii 20)))
+    (default-to u0 (map-get? GlobalAnalytics metric))
+)
+
+(define-private (calculate-reputation-score (owner principal))
+    (let (
+        (reputation (get-owner-reputation owner))
+        (success-rate (if (> (get total-projects reputation) u0)
+            (/ (* (get successful-projects reputation) u100) (get total-projects reputation))
+            u0))
+        (volume-calc (/ (get total-funds-raised reputation) u1000000))
+        (volume-bonus (if (< volume-calc u200) volume-calc u200))
+        (streak-bonus (if (> (get successful-projects reputation) u3) u100 u0))
+        (base-score (+ (* success-rate u5) volume-bonus streak-bonus))
+        (clamped-score (if (< base-score min-reputation-score) min-reputation-score base-score))
+    )
+        (if (> clamped-score max-reputation-score) max-reputation-score clamped-score)
+    )
+)
+
+(define-private (calculate-project-risk-score (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) u50))
+        (owner-reputation (get-owner-reputation (get owner project)))
+        (funding-ratio (if (> (get target-amount project) u0)
+            (/ (* (get current-amount project) u100) (get target-amount project))
+            u0))
+        (investor-diversity (if (< (get investor-count project) u20) (get investor-count project) u20))
+        (reputation-factor (/ (get reputation-score owner-reputation) u20))
+        (risk-score (- u100 (/ (+ funding-ratio investor-diversity reputation-factor) u3)))
+        (clamped-risk (if (< risk-score u0) u0 risk-score))
+    )
+        (if (> clamped-risk u100) u100 clamped-risk)
+    )
+)
+
+(define-private (update-global-analytics (metric (string-ascii 20)) (value uint))
+    (map-set GlobalAnalytics metric value)
+)
+
+(define-public (update-project-analytics (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u42)))
+        (milestone-count (get-milestone-count project-id))
+        (current-analytics (get-project-analytics project-id))
+        (funding-velocity (if (> (get current-amount project) u0)
+            (/ (get current-amount project) (- stacks-block-height (get stacks-block-height (unwrap-panic (get-investment project-id (get owner project))))))
+            u0))
+        (risk-score (calculate-project-risk-score project-id))
+    )
+        (map-set ProjectAnalytics project-id {
+            funding-velocity: funding-velocity,
+            milestone-completion-rate: (get milestone-completion-rate current-analytics),
+            investor-satisfaction: (get investor-satisfaction current-analytics),
+            project-risk-score: risk-score,
+            funding-timeline: (- stacks-block-height (get stacks-block-height (unwrap-panic (get-investment project-id (get owner project))))),
+            community-engagement: (get community-engagement current-analytics)
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-owner-reputation (owner principal) (project-id uint) (success bool))
+    (let (
+        (current-reputation (get-owner-reputation owner))
+        (project (unwrap! (map-get? Projects project-id) (err u43)))
+        (new-total-projects (+ (get total-projects current-reputation) u1))
+        (new-successful (if success (+ (get successful-projects current-reputation) u1) (get successful-projects current-reputation)))
+        (new-failed (if success (get failed-projects current-reputation) (+ (get failed-projects current-reputation) u1)))
+        (new-funds-raised (+ (get total-funds-raised current-reputation) (get current-amount project)))
+        (new-reputation-score (calculate-reputation-score owner))
+    )
+        (map-set ProjectOwnerReputation owner {
+            total-projects: new-total-projects,
+            successful-projects: new-successful,
+            failed-projects: new-failed,
+            total-funds-raised: new-funds-raised,
+            average-completion-time: (get average-completion-time current-reputation),
+            reputation-score: new-reputation-score,
+            last-updated: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (update-investor-performance (investor principal) (project-id uint) (success bool))
+    (let (
+        (current-performance (get-investor-performance investor))
+        (investment (unwrap! (map-get? Investments { project-id: project-id, investor: investor }) (err u44)))
+        (new-total-investments (+ (get total-investments current-performance) u1))
+        (new-successful (if success (+ (get successful-investments current-performance) u1) (get successful-investments current-performance)))
+        (new-failed (if success (get failed-investments current-performance) (+ (get failed-investments current-performance) u1)))
+        (new-streak (if success (+ (get investment-streak current-performance) u1) u0))
+    )
+        (map-set InvestorPerformance investor {
+            total-investments: new-total-investments,
+            successful-investments: new-successful,
+            failed-investments: new-failed,
+            total-invested-amount: (+ (get total-invested-amount current-performance) (get amount investment)),
+            total-returns: (get total-returns current-performance),
+            average-roi: (get average-roi current-performance),
+            investment-streak: new-streak,
+            last-investment-block: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (distribute-returns (project-id uint) (return-amount uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u45)))
+        (current-returns (get-project-returns project-id))
+    )
+        (asserts! (is-eq tx-sender (get owner project)) (err u46))
+        (asserts! (is-eq (get status project) "completed") (err u47))
+        (asserts! (> return-amount u0) (err u48))
+        
+        (map-set ProjectReturns project-id {
+            total-returned: (+ (get total-returned current-returns) return-amount),
+            return-rate: (if (> (get current-amount project) u0)
+                (/ (* (+ (get total-returned current-returns) return-amount) u100) (get current-amount project))
+                u0),
+            distribution-count: (+ (get distribution-count current-returns) u1),
+            last-distribution: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (claim-investor-returns (project-id uint) (return-amount uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u49)))
+        (investment (unwrap! (map-get? Investments { project-id: project-id, investor: tx-sender }) (err u50)))
+        (current-returns (get-investor-returns project-id tx-sender))
+        (project-returns (get-project-returns project-id))
+        (investor-share (/ (* return-amount (get amount investment)) (get current-amount project)))
+        (current-performance (get-investor-performance tx-sender))
+    )
+        (asserts! (is-eq (get status project) "completed") (err u51))
+        (asserts! (> return-amount u0) (err u52))
+        (asserts! (> (get total-returned project-returns) u0) (err u53))
+        
+        (try! (as-contract (stx-transfer? investor-share tx-sender tx-sender)))
+        
+        (map-set InvestorReturns { project-id: project-id, investor: tx-sender } {
+            total-returned: (+ (get total-returned current-returns) investor-share),
+            return-percentage: (if (> (get amount investment) u0)
+                (/ (* (+ (get total-returned current-returns) investor-share) u100) (get amount investment))
+                u0),
+            distribution-history: (unwrap-panic (as-max-len? 
+                (append (get distribution-history current-returns) investor-share)
+                u10))
+        })
+        
+        (let (
+            (new-total-returns (+ (get total-returns current-performance) investor-share))
+            (new-avg-roi (if (> (get total-invested-amount current-performance) u0)
+                (/ (* new-total-returns u100) (get total-invested-amount current-performance))
+                u0))
+        )
+            (map-set InvestorPerformance tx-sender (merge current-performance {
+                total-returns: new-total-returns,
+                average-roi: new-avg-roi
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-top-performing-owners (limit uint))
+    (ok (list))
+)
+
+(define-read-only (get-project-performance-summary (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u54)))
+        (analytics (get-project-analytics project-id))
+        (returns (get-project-returns project-id))
+        (owner-reputation (get-owner-reputation (get owner project)))
+    )
+        (ok {
+            project-status: (get status project),
+            funding-completion: (if (> (get target-amount project) u0)
+                (/ (* (get current-amount project) u100) (get target-amount project))
+                u0),
+            owner-reputation-score: (get reputation-score owner-reputation),
+            risk-score: (get project-risk-score analytics),
+            return-rate: (get return-rate returns),
+            investor-count: (get investor-count project),
+            funding-velocity: (get funding-velocity analytics)
+        })
+    )
+)
+
+(define-read-only (calculate-investment-recommendation (project-id uint) (investor principal))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u55)))
+        (analytics (get-project-analytics project-id))
+        (owner-reputation (get-owner-reputation (get owner project)))
+        (investor-performance (get-investor-performance investor))
+        (risk-score (get project-risk-score analytics))
+        (reputation-score (get reputation-score owner-reputation))
+        (recommendation-score (- (+ reputation-score (- u100 risk-score)) u50))
+    )
+        (let (
+            (clamped-recommendation (if (< recommendation-score u0) u0 recommendation-score))
+            (final-recommendation (if (> clamped-recommendation u100) u100 clamped-recommendation))
+        )
+            (ok {
+                recommendation-score: final-recommendation,
+                risk-level: (if (< risk-score u30) "low" (if (< risk-score u70) "medium" "high")),
+                owner-track-record: (if (> reputation-score u700) "excellent" (if (> reputation-score u400) "good" "average")),
+                suggested-investment: (if (> final-recommendation u70) "recommended" (if (> final-recommendation u40) "consider" "avoid"))
+            })
         )
     )
 )
