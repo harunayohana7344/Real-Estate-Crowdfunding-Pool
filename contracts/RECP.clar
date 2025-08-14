@@ -688,3 +688,237 @@
         )
     )
 )
+
+;; Insurance Pool System - Protects investors against project failures
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-claims-paid uint u0)
+(define-data-var insurance-fee-rate uint u300) ;; 3% of successful project funds
+(define-data-var max-coverage-rate uint u7000) ;; 70% max coverage of investment
+(define-data-var claim-processing-period uint u1008) ;; Blocks to wait before processing claims
+
+(define-map InsuranceClaims uint {
+    project-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    coverage-amount: uint,
+    claim-status: (string-ascii 20),
+    claim-submitted: uint,
+    votes-for: uint,
+    votes-against: uint,
+    voting-deadline: uint
+})
+
+(define-map InsuranceClaimCount principal uint)
+(define-map ClaimVotes { claim-id: uint, voter: principal } bool)
+(define-map ProjectInsuranceCoverage uint {
+    total-covered: uint,
+    coverage-rate: uint,
+    premium-paid: uint,
+    eligible-for-claims: bool
+})
+
+(define-map InvestorInsurance { project-id: uint, investor: principal } {
+    insured-amount: uint,
+    premium-rate: uint,
+    coverage-start: uint,
+    claim-eligible: bool
+})
+
+(define-data-var next-claim-id uint u0)
+
+(define-constant insurance-voting-period u504) ;; 3.5 days
+(define-constant min-coverage-threshold u5000000) ;; Minimum project size for insurance
+(define-constant claim-approval-threshold u51) ;; 51% approval needed
+
+(define-read-only (get-insurance-pool-balance)
+    (var-get insurance-pool-balance)
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (map-get? InsuranceClaims claim-id)
+)
+
+(define-read-only (get-project-insurance-coverage (project-id uint))
+    (default-to 
+        {
+            total-covered: u0,
+            coverage-rate: u0,
+            premium-paid: u0,
+            eligible-for-claims: false
+        }
+        (map-get? ProjectInsuranceCoverage project-id)
+    )
+)
+
+(define-read-only (get-investor-insurance (project-id uint) (investor principal))
+    (default-to 
+        {
+            insured-amount: u0,
+            premium-rate: u0,
+            coverage-start: u0,
+            claim-eligible: false
+        }
+        (map-get? InvestorInsurance { project-id: project-id, investor: investor })
+    )
+)
+
+(define-read-only (calculate-insurance-premium (investment-amount uint) (project-risk-score uint))
+    (let (
+        (base-premium (/ (* investment-amount u200) u10000)) ;; 2% base premium
+        (risk-multiplier (if (< project-risk-score u30) u50 
+                           (if (< project-risk-score u70) u100 u150)))
+        (adjusted-premium (/ (* base-premium risk-multiplier) u100))
+    )
+        adjusted-premium
+    )
+)
+
+(define-public (purchase-investment-insurance (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u56)))
+        (investment (unwrap! (map-get? Investments { project-id: project-id, investor: tx-sender }) (err u57)))
+        (analytics (get-project-analytics project-id))
+        (risk-score (get project-risk-score analytics))
+        (premium-amount (calculate-insurance-premium (get amount investment) risk-score))
+        (coverage-amount (/ (* (get amount investment) (var-get max-coverage-rate)) u10000))
+    )
+        (asserts! (is-eq (get status project) "active") (err u58))
+        (asserts! (>= (get target-amount project) min-coverage-threshold) (err u59))
+        (asserts! (>= (stx-get-balance tx-sender) premium-amount) (err u60))
+        
+        (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium-amount))
+        
+        (map-set InvestorInsurance { project-id: project-id, investor: tx-sender } {
+            insured-amount: coverage-amount,
+            premium-rate: (/ (* premium-amount u10000) (get amount investment)),
+            coverage-start: stacks-block-height,
+            claim-eligible: true
+        })
+        
+        (let ((current-coverage (get-project-insurance-coverage project-id)))
+            (map-set ProjectInsuranceCoverage project-id {
+                total-covered: (+ (get total-covered current-coverage) coverage-amount),
+                coverage-rate: (/ (* (+ (get total-covered current-coverage) coverage-amount) u10000) (get current-amount project)),
+                premium-paid: (+ (get premium-paid current-coverage) premium-amount),
+                eligible-for-claims: true
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (submit-insurance-claim (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u61)))
+        (investment (unwrap! (map-get? Investments { project-id: project-id, investor: tx-sender }) (err u62)))
+        (insurance (unwrap! (map-get? InvestorInsurance { project-id: project-id, investor: tx-sender }) (err u63)))
+        (claim-id (var-get next-claim-id))
+    )
+        (asserts! (is-eq (get status project) "failed") (err u64))
+        (asserts! (is-eq (get claim-eligible insurance) true) (err u65))
+        (asserts! (>= stacks-block-height (+ (get coverage-start insurance) (var-get claim-processing-period))) (err u66))
+        
+        (map-set InsuranceClaims claim-id {
+            project-id: project-id,
+            claimant: tx-sender,
+            claim-amount: (get amount investment),
+            coverage-amount: (get insured-amount insurance),
+            claim-status: "pending",
+            claim-submitted: stacks-block-height,
+            votes-for: u0,
+            votes-against: u0,
+            voting-deadline: (+ stacks-block-height insurance-voting-period)
+        })
+        
+        (var-set next-claim-id (+ claim-id u1))
+        (ok claim-id)
+    )
+)
+
+(define-public (vote-on-insurance-claim (claim-id uint) (support bool))
+    (let (
+        (claim (unwrap! (map-get? InsuranceClaims claim-id) (err u67)))
+        (existing-vote (map-get? ClaimVotes { claim-id: claim-id, voter: tx-sender }))
+        (voter-investment (map-get? Investments { project-id: (get project-id claim), investor: tx-sender }))
+    )
+        (asserts! (is-eq (get claim-status claim) "pending") (err u68))
+        (asserts! (< stacks-block-height (get voting-deadline claim)) (err u69))
+        (asserts! (is-none existing-vote) (err u70))
+        (asserts! (is-some voter-investment) (err u71)) ;; Only investors can vote
+        
+        (map-set ClaimVotes { claim-id: claim-id, voter: tx-sender } support)
+        
+        (map-set InsuranceClaims claim-id (merge claim {
+            votes-for: (if support (+ (get votes-for claim) u1) (get votes-for claim)),
+            votes-against: (if support (get votes-against claim) (+ (get votes-against claim) u1))
+        }))
+        (ok true)
+    )
+)
+
+(define-public (process-insurance-claim (claim-id uint))
+    (let (
+        (claim (unwrap! (map-get? InsuranceClaims claim-id) (err u72)))
+        (total-votes (+ (get votes-for claim) (get votes-against claim)))
+        (approval-rate (if (> total-votes u0) (/ (* (get votes-for claim) u100) total-votes) u0))
+        (coverage-amount (get coverage-amount claim))
+    )
+        (asserts! (>= stacks-block-height (get voting-deadline claim)) (err u73))
+        (asserts! (is-eq (get claim-status claim) "pending") (err u74))
+        (asserts! (>= (var-get insurance-pool-balance) coverage-amount) (err u75))
+        
+        (if (>= approval-rate claim-approval-threshold)
+            (begin
+                (try! (as-contract (stx-transfer? coverage-amount tx-sender (get claimant claim))))
+                (var-set insurance-pool-balance (- (var-get insurance-pool-balance) coverage-amount))
+                (var-set total-claims-paid (+ (var-get total-claims-paid) coverage-amount))
+                (map-set InsuranceClaims claim-id (merge claim { claim-status: "approved" }))
+                (ok true)
+            )
+            (begin
+                (map-set InsuranceClaims claim-id (merge claim { claim-status: "rejected" }))
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (contribute-to-insurance-pool (project-id uint))
+    (let (
+        (project (unwrap! (map-get? Projects project-id) (err u76)))
+        (contribution-amount (/ (* (get current-amount project) (var-get insurance-fee-rate)) u10000))
+    )
+        (asserts! (is-eq (get status project) "completed") (err u77))
+        (asserts! (is-eq tx-sender (get owner project)) (err u78))
+        
+        (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) contribution-amount))
+        (ok true)
+    )
+)
+
+(define-public (update-insurance-parameters (new-fee-rate uint) (new-max-coverage uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u79))
+        (asserts! (and (<= new-fee-rate u1000) (>= new-fee-rate u100)) (err u80)) ;; 1-10%
+        (asserts! (and (<= new-max-coverage u8000) (>= new-max-coverage u5000)) (err u81)) ;; 50-80%
+        
+        (var-set insurance-fee-rate new-fee-rate)
+        (var-set max-coverage-rate new-max-coverage)
+        (ok true)
+    )
+)
+
+(define-read-only (get-insurance-pool-stats)
+    (ok {
+        total-pool-balance: (var-get insurance-pool-balance),
+        total-claims-paid: (var-get total-claims-paid),
+        current-fee-rate: (var-get insurance-fee-rate),
+        max-coverage-rate: (var-get max-coverage-rate),
+        pool-utilization: (if (> (var-get insurance-pool-balance) u0)
+            (/ (* (var-get total-claims-paid) u100) (var-get insurance-pool-balance))
+            u0)
+    })
+)
+
